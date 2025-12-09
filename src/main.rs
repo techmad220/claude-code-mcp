@@ -5,6 +5,8 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
+#[allow(unused_imports)]
+use serde_json::Value as JsonValue;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 mod protocol;
@@ -82,6 +84,8 @@ fn get_tools() -> Vec<Tool> {
 
 /// Handle an incoming JSON-RPC request
 async fn handle_request(request: JsonRpcRequest) -> JsonRpcResponse {
+    let id = request.id.clone();
+
     match request.method.as_str() {
         "initialize" => {
             let result = InitializeResult {
@@ -94,17 +98,23 @@ async fn handle_request(request: JsonRpcRequest) -> JsonRpcResponse {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             };
-            JsonRpcResponse::success(request.id, serde_json::to_value(result).unwrap())
+            JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
         }
 
         "notifications/initialized" | "initialized" => {
-            // No response needed for notifications
-            JsonRpcResponse::success(request.id, json!({}))
+            // Notifications don't get responses - but we need to return something
+            // Use a special marker that main loop can skip
+            return JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Value::Null,
+                result: None,
+                error: None,
+            };
         }
 
         "tools/list" => {
             let tools = get_tools();
-            JsonRpcResponse::success(request.id, json!({ "tools": tools }))
+            JsonRpcResponse::success(id, json!({ "tools": tools }))
         }
 
         "tools/call" => {
@@ -116,11 +126,11 @@ async fn handle_request(request: JsonRpcRequest) -> JsonRpcResponse {
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
             let result = handle_tool_call(tool_name, arguments).await;
-            JsonRpcResponse::success(request.id, serde_json::to_value(result).unwrap())
+            JsonRpcResponse::success(id, serde_json::to_value(result).unwrap())
         }
 
         _ => JsonRpcResponse::error(
-            request.id,
+            id,
             -32601,
             format!("Method not found: {}", request.method),
         ),
@@ -255,14 +265,29 @@ async fn main() -> Result<()> {
 
         match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(request) => {
+                // Check if this is a notification (no id means notification)
+                let is_notification = request.id.is_null() ||
+                    request.method.starts_with("notifications/");
+
                 let response = handle_request(request).await;
+
+                // Don't send response for notifications
+                if is_notification {
+                    continue;
+                }
+
+                // Skip empty responses (for notifications that slipped through)
+                if response.result.is_none() && response.error.is_none() {
+                    continue;
+                }
+
                 let response_json = serde_json::to_string(&response)?;
                 stdout.write_all(response_json.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
                 stdout.flush().await?;
             }
             Err(e) => {
-                let error = JsonRpcResponse::error(None, -32700, format!("Parse error: {}", e));
+                let error = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {}", e));
                 let error_json = serde_json::to_string(&error)?;
                 stdout.write_all(error_json.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;

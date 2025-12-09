@@ -8,7 +8,8 @@ use serde_json::Value;
 #[allow(dead_code)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
-    pub id: Option<Value>,
+    #[serde(default)]
+    pub id: Value,
     pub method: String,
     #[serde(default)]
     pub params: Option<Value>,
@@ -18,8 +19,7 @@ pub struct JsonRpcRequest {
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<Value>,
+    pub id: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,7 +35,7 @@ pub struct JsonRpcError {
 }
 
 impl JsonRpcResponse {
-    pub fn success(id: Option<Value>, result: Value) -> Self {
+    pub fn success(id: Value, result: Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
@@ -44,7 +44,7 @@ impl JsonRpcResponse {
         }
     }
 
-    pub fn error(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
+    pub fn error(id: Value, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,

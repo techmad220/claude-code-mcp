@@ -1,8 +1,7 @@
 //! Claude Code session history parser
 //!
-//! Claude Code stores sessions in ~/.claude/ with structure:
-//! - projects/<project-hash>/sessions/<session-id>.json
-//! - Or potentially in other locations depending on version
+//! Claude Code stores sessions in ~/.claude/projects/<project-hash>/<session-id>.jsonl
+//! Each line is a JSON object with type, message, timestamp, sessionId fields.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -17,6 +16,7 @@ use walkdir::WalkDir;
 pub struct Session {
     pub id: String,
     pub project_path: Option<String>,
+    pub cwd: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub messages: Vec<Message>,
@@ -37,6 +37,7 @@ pub struct Message {
 pub struct SessionSummary {
     pub id: String,
     pub project_path: Option<String>,
+    pub cwd: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub message_count: usize,
@@ -47,6 +48,7 @@ pub struct SessionSummary {
 #[derive(Debug, Serialize)]
 pub struct SessionContext {
     pub id: String,
+    pub cwd: Option<String>,
     pub initial_request: Option<String>,
     pub message_count: usize,
     pub files_mentioned: Vec<String>,
@@ -79,17 +81,26 @@ impl SessionStore {
     /// List all sessions, sorted by recency
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>> {
         let mut sessions = Vec::new();
+        let projects_dir = self.base_path.join("projects");
 
-        // Walk through the claude directory looking for session files
-        for entry in WalkDir::new(&self.base_path)
-            .max_depth(5)
+        if !projects_dir.exists() {
+            return Ok(sessions);
+        }
+
+        // Walk through the projects directory looking for .jsonl session files
+        for entry in WalkDir::new(&projects_dir)
+            .max_depth(3)
             .follow_links(true)
             .into_iter()
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
-                if let Ok(Some(session)) = self.try_parse_session(path) {
+            if path.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                // Skip agent files (subagent sessions)
+                if path.file_name().map_or(false, |n| n.to_string_lossy().starts_with("agent-")) {
+                    continue;
+                }
+                if let Ok(Some(session)) = self.try_parse_jsonl_session(path) {
                     sessions.push(session_to_summary(&session));
                 }
             }
@@ -108,16 +119,24 @@ impl SessionStore {
     pub fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SessionSummary>> {
         let matcher = SkimMatcherV2::default();
         let mut results: Vec<(i64, SessionSummary)> = Vec::new();
+        let projects_dir = self.base_path.join("projects");
 
-        for entry in WalkDir::new(&self.base_path)
-            .max_depth(5)
+        if !projects_dir.exists() {
+            return Ok(vec![]);
+        }
+
+        for entry in WalkDir::new(&projects_dir)
+            .max_depth(3)
             .follow_links(true)
             .into_iter()
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
-                if let Ok(Some(session)) = self.try_parse_session(path) {
+            if path.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                if path.file_name().map_or(false, |n| n.to_string_lossy().starts_with("agent-")) {
+                    continue;
+                }
+                if let Ok(Some(session)) = self.try_parse_jsonl_session(path) {
                     // Search through all message content
                     let full_text: String = session
                         .messages
@@ -146,17 +165,26 @@ impl SessionStore {
 
     /// Get full session by ID
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
-        for entry in WalkDir::new(&self.base_path)
-            .max_depth(5)
+        let projects_dir = self.base_path.join("projects");
+
+        if !projects_dir.exists() {
+            return Ok(None);
+        }
+
+        for entry in WalkDir::new(&projects_dir)
+            .max_depth(3)
             .follow_links(true)
             .into_iter()
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "json") {
-                if let Ok(Some(session)) = self.try_parse_session(path) {
-                    if session.id == session_id {
-                        return Ok(Some(session));
+            if path.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
+                // Check if filename matches session_id
+                if let Some(stem) = path.file_stem() {
+                    if stem.to_string_lossy() == session_id {
+                        if let Ok(Some(session)) = self.try_parse_jsonl_session(path) {
+                            return Ok(Some(session));
+                        }
                     }
                 }
             }
@@ -170,7 +198,7 @@ impl SessionStore {
             let initial_request = session
                 .messages
                 .iter()
-                .find(|m| m.role == "user" || m.role == "human")
+                .find(|m| m.role == "user")
                 .map(|m| {
                     let content: String = m.content.chars().take(500).collect();
                     if m.content.len() > 500 {
@@ -188,6 +216,7 @@ impl SessionStore {
 
             return Ok(Some(SessionContext {
                 id: session.id,
+                cwd: session.cwd,
                 initial_request,
                 message_count: session.messages.len(),
                 files_mentioned,
@@ -197,147 +226,148 @@ impl SessionStore {
         Ok(None)
     }
 
-    /// Try to parse a file as a session
-    fn try_parse_session(&self, path: &Path) -> Result<Option<Session>> {
+    /// Parse a JSONL session file (Claude Code's actual format)
+    fn try_parse_jsonl_session(&self, path: &Path) -> Result<Option<Session>> {
         let content = std::fs::read_to_string(path)?;
+        let lines: Vec<&str> = content.lines().collect();
 
-        // Try parsing as single JSON object
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(session) = parse_session_value(&value, path) {
-                return Ok(Some(session));
-            }
+        if lines.is_empty() {
+            return Ok(None);
         }
 
-        // Try parsing as JSONL (one message per line)
-        let lines: Vec<&str> = content.lines().collect();
-        if !lines.is_empty() {
-            let mut messages = Vec::new();
-            for line in lines {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                    let role = value
-                        .get("role")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let content = extract_content(&value);
-                    if !content.is_empty() {
-                        messages.push(Message {
-                            role,
-                            content,
-                            timestamp: None,
-                        });
-                    }
+        let mut messages = Vec::new();
+        let mut session_id: Option<String> = None;
+        let mut cwd: Option<String> = None;
+        let mut first_timestamp: Option<DateTime<Utc>> = None;
+        let mut last_timestamp: Option<DateTime<Utc>> = None;
+
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let value: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Get session ID from any entry
+            if session_id.is_none() {
+                session_id = value.get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+
+            // Get cwd from any entry
+            if cwd.is_none() {
+                cwd = value.get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+
+            // Parse timestamp
+            let timestamp = value.get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+
+            if let Some(ts) = timestamp {
+                if first_timestamp.is_none() || Some(ts) < first_timestamp {
+                    first_timestamp = Some(ts);
+                }
+                if last_timestamp.is_none() || Some(ts) > last_timestamp {
+                    last_timestamp = Some(ts);
                 }
             }
-            if !messages.is_empty() {
-                let id = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| uuid_from_path(path));
 
-                return Ok(Some(Session {
-                    id,
-                    project_path: extract_project_path(path),
-                    created_at: None,
-                    updated_at: path
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .map(DateTime::from),
-                    messages,
-                    file_path: path.to_path_buf(),
-                }));
+            // Only process user and assistant messages
+            let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if msg_type != "user" && msg_type != "assistant" {
+                continue;
+            }
+
+            // Extract role and content from the message field
+            if let Some(message) = value.get("message") {
+                let role = message.get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(msg_type)
+                    .to_string();
+
+                let content = extract_message_content(message);
+
+                if !content.is_empty() {
+                    messages.push(Message {
+                        role,
+                        content,
+                        timestamp,
+                    });
+                }
             }
         }
-        Ok(None)
-    }
-}
 
-/// Parse a JSON value as a session
-fn parse_session_value(value: &serde_json::Value, path: &Path) -> Option<Session> {
-    // Look for messages array
-    let messages_value = value.get("messages").or_else(|| value.get("conversation"))?;
-    let messages_arr = messages_value.as_array()?;
+        if messages.is_empty() {
+            return Ok(None);
+        }
 
-    let messages: Vec<Message> = messages_arr
-        .iter()
-        .filter_map(|m| {
-            let role = m
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let content = extract_content(m);
-            if content.is_empty() {
-                None
-            } else {
-                Some(Message {
-                    role,
-                    content,
-                    timestamp: m
-                        .get("timestamp")
-                        .and_then(|t| t.as_str())
-                        .and_then(|s| s.parse().ok()),
-                })
-            }
-        })
-        .collect();
-
-    if messages.is_empty() {
-        return None;
-    }
-
-    let id = value
-        .get("id")
-        .or_else(|| value.get("session_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
+        // Use filename as session ID if not found in content
+        let id = session_id.unwrap_or_else(|| {
             path.file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| uuid_from_path(path))
         });
 
-    Some(Session {
-        id,
-        project_path: extract_project_path(path),
-        created_at: value
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok()),
-        updated_at: value
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
+        Ok(Some(Session {
+            id,
+            project_path: extract_project_path(path),
+            cwd,
+            created_at: first_timestamp,
+            updated_at: last_timestamp.or_else(|| {
                 path.metadata()
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .map(DateTime::from)
             }),
-        messages,
-        file_path: path.to_path_buf(),
-    })
+            messages,
+            file_path: path.to_path_buf(),
+        }))
+    }
 }
 
-/// Extract content from a message value (handles both string and array formats)
-fn extract_content(value: &serde_json::Value) -> String {
-    if let Some(content) = value.get("content") {
+/// Extract content from a message object (handles both string and array content formats)
+fn extract_message_content(message: &serde_json::Value) -> String {
+    if let Some(content) = message.get("content") {
+        // String content
         if let Some(s) = content.as_str() {
             return s.to_string();
         }
+
+        // Array content (assistant messages with tool_use, text blocks, etc.)
         if let Some(arr) = content.as_array() {
-            return arr
-                .iter()
-                .filter_map(|item| {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        Some(text.to_string())
-                    } else {
-                        item.as_str().map(|s| s.to_string())
+            let mut parts = Vec::new();
+            for item in arr {
+                // Text block: {"type": "text", "text": "..."}
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    parts.push(text.to_string());
+                }
+                // Tool use block: extract tool name and input summary
+                else if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                        let input_summary = item.get("input")
+                            .map(|i| {
+                                if let Some(fp) = i.get("file_path").and_then(|f| f.as_str()) {
+                                    format!(" on {}", fp)
+                                } else if let Some(cmd) = i.get("command").and_then(|c| c.as_str()) {
+                                    let cmd_preview: String = cmd.chars().take(50).collect();
+                                    format!(": {}", cmd_preview)
+                                } else {
+                                    String::new()
+                                }
+                            })
+                            .unwrap_or_default();
+                        parts.push(format!("[Tool: {}{}]", name, input_summary));
                     }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+                }
+            }
+            return parts.join("\n");
         }
     }
     String::new()
@@ -345,11 +375,15 @@ fn extract_content(value: &serde_json::Value) -> String {
 
 /// Extract project path from session file path
 fn extract_project_path(path: &Path) -> Option<String> {
-    // Try to find "projects" in the path and get the project name
     let components: Vec<_> = path.components().collect();
     for (i, comp) in components.iter().enumerate() {
         if comp.as_os_str() == "projects" && i + 1 < components.len() {
-            return Some(components[i + 1].as_os_str().to_string_lossy().to_string());
+            let project_hash = components[i + 1].as_os_str().to_string_lossy().to_string();
+            // Convert hash back to readable path if it starts with -
+            if project_hash.starts_with('-') {
+                return Some(project_hash.replace('-', "/"));
+            }
+            return Some(project_hash);
         }
     }
     None
@@ -368,7 +402,7 @@ fn session_to_summary(session: &Session) -> SessionSummary {
     let preview = session
         .messages
         .iter()
-        .find(|m| m.role == "user" || m.role == "human")
+        .find(|m| m.role == "user")
         .map(|m| {
             let content: String = m.content.chars().take(200).collect();
             if m.content.len() > 200 {
@@ -382,6 +416,7 @@ fn session_to_summary(session: &Session) -> SessionSummary {
     SessionSummary {
         id: session.id.clone(),
         project_path: session.project_path.clone(),
+        cwd: session.cwd.clone(),
         created_at: session.created_at.map(|dt| dt.to_rfc3339()),
         updated_at: session.updated_at.map(|dt| dt.to_rfc3339()),
         message_count: session.messages.len(),
@@ -394,14 +429,14 @@ fn extract_file_paths(session: &Session) -> Vec<String> {
     use std::collections::HashSet;
     let mut paths = HashSet::new();
 
-    // Simple regex-like matching for file paths
     for msg in &session.messages {
         for word in msg.content.split_whitespace() {
-            // Look for things that look like file paths
             if (word.contains('/') || word.contains('\\'))
                 && (word.contains('.') || word.ends_with('/'))
             {
-                let cleaned = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.' && c != '_' && c != '-');
+                let cleaned = word.trim_matches(|c: char| {
+                    !c.is_alphanumeric() && c != '/' && c != '\\' && c != '.' && c != '_' && c != '-'
+                });
                 if cleaned.len() > 3 {
                     paths.insert(cleaned.to_string());
                 }
@@ -431,8 +466,11 @@ fn extract_key_terms(session: &Session) -> Vec<String> {
         "same", "so", "than", "too", "very", "just", "and", "but", "if", "or",
         "because", "until", "while", "this", "that", "these", "those", "i", "you",
         "he", "she", "it", "we", "they", "what", "which", "who", "whom", "its",
-        "his", "her", "their", "my", "your", "our",
-    ].iter().copied().collect();
+        "his", "her", "their", "my", "your", "our", "tool", "file", "path",
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     let mut word_counts: HashMap<String, usize> = HashMap::new();
 
@@ -461,23 +499,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_content_string() {
-        let value = serde_json::json!({
+    fn test_extract_message_content_string() {
+        let message = serde_json::json!({
             "role": "user",
             "content": "Hello world"
         });
-        assert_eq!(extract_content(&value), "Hello world");
+        assert_eq!(extract_message_content(&message), "Hello world");
     }
 
     #[test]
-    fn test_extract_content_array() {
-        let value = serde_json::json!({
+    fn test_extract_message_content_array() {
+        let message = serde_json::json!({
             "role": "assistant",
             "content": [
-                {"type": "text", "text": "Hello"},
-                {"type": "text", "text": "World"}
+                {"type": "text", "text": "Here is the result"},
+                {"type": "tool_use", "name": "Write", "input": {"file_path": "/test/file.rs"}}
             ]
         });
-        assert_eq!(extract_content(&value), "Hello\nWorld");
+        let content = extract_message_content(&message);
+        assert!(content.contains("Here is the result"));
+        assert!(content.contains("[Tool: Write on /test/file.rs]"));
+    }
+
+    #[test]
+    fn test_extract_project_path() {
+        let path = Path::new("/home/user/.claude/projects/-home-user-myproject/session.jsonl");
+        let project = extract_project_path(path);
+        assert_eq!(project, Some("/home/user/myproject".to_string()));
     }
 }
